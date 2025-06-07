@@ -29,6 +29,46 @@ from megatron.model.language_model import Embedding
 import fused_weight_gradient_mlp_cuda
 
 
+
+def _all_to_all_func(input_, world_size, group, scatter_dim, gather_dim):
+    input_list = [t.contiguous() for t in torch.tensor_split(input_, world_size, scatter_dim)]
+    output_list = [torch.empty_like(input_list[0]) for _ in range(world_size)]
+    torch.distributed.all_to_all(output_list, input_list, group=group)
+    return torch.cat(output_list, dim=gather_dim).contiguous()
+
+
+class _AllToAll(torch.autograd.Function):
+    """All-to-all communication.
+
+    Args:
+        input_: input matrix
+        process_group: communication group
+        scatter_dim: scatter dimension
+        gather_dim: gather dimension
+    """
+
+    @staticmethod
+    def forward(ctx, input_, process_group, scatter_dim, gather_dim):
+        ctx.process_group = process_group
+        ctx.scatter_dim = scatter_dim
+        ctx.gather_dim = gather_dim
+        world_size = torch.distributed.get_world_size(process_group)
+
+        return _all_to_all_func(input_, world_size, process_group, scatter_dim, gather_dim)
+
+    @staticmethod
+    def backward(ctx, *grad_output):
+        process_group = ctx.process_group
+        scatter_dim = ctx.gather_dim
+        gather_dim = ctx.scatter_dim
+        return_grad = _AllToAll.apply(*grad_output, process_group, scatter_dim, gather_dim)
+        return (return_grad, None, None, None)
+
+
+def all_to_all_comm(input_, process_group=None, scatter_dim=2, gather_dim=1):
+    return _AllToAll.apply(input_, process_group, scatter_dim, gather_dim)
+
+
 class GradPatch(torch.autograd.Function):
     
     @staticmethod
@@ -62,17 +102,23 @@ class PreAttnModule(MegatronModule):
         # Self attention - QKV Linear
         query_projection_size, kv_projection_size = self._add_attention_block_attrs(
             args, config, layer_number, AttnType.self_attn, self_attn_mask_type)
-        self.query_key_value = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                query_projection_size + 2 * kv_projection_size,
-                config=config,
-                init_method=config.init_method,
-                bias=args.add_bias_linear,
-                gather_output=False)
+        if args.ulysses_sp:
+            self.query_key_value = torch.nn.Linear(
+                config.hidden_size, query_projection_size + 2 * kv_projection_size,
+                bias=args.add_bias_linear)
+        else:
+            self.query_key_value = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    query_projection_size + 2 * kv_projection_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=args.add_bias_linear,
+                    gather_output=False)
         
         self.transfer_weight = args.transfer_weight
 
         self.chunk_size = args.chunk_size
+        self.ulysses_sp = args.ulysses_sp
     
     def _add_attention_block_attrs(self, args, config, 
                                    layer_number, attention_type, attn_mask_type):
@@ -395,14 +441,19 @@ class PostAttnModule(MegatronModule):
         
         ############### kernel 4 ################
         # Self attention - O Linear
-        self.dense = tensor_parallel.RowParallelLinear(
-            config.kv_channels * config.num_attention_heads, # query_projection_size,
-            config.hidden_size,
-            config=config,
-            init_method=config.output_layer_init_method,
-            bias=args.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True)
+        if args.ulysses_sp:
+            self.dense = torch.nn.Linear(
+                config.kv_channels * config.num_attention_heads, config.hidden_size,
+                bias=args.add_bias_linear,)
+        else:
+            self.dense = tensor_parallel.RowParallelLinear(
+                config.kv_channels * config.num_attention_heads, # query_projection_size,
+                config.hidden_size,
+                config=config,
+                init_method=config.output_layer_init_method,
+                bias=args.add_bias_linear,
+                input_is_parallel=True,
+                skip_bias_add=True)
         
         # hidden dropout is appended to O Linear
         self.hidden_dropout = config.hidden_dropout
@@ -459,6 +510,7 @@ class PostAttnModule(MegatronModule):
 
         self.chunk_size = args.chunk_size
         self.sequence_parallel = config.sequence_parallel
+        self.ulysses_sp = args.ulysses_sp
     
     def _add_mlp_block_attrs(self, args, config):
         self.add_bias = config.add_bias_linear
@@ -496,7 +548,15 @@ class PostAttnModule(MegatronModule):
 
     def single_forward(self, context_layer, residual):
         ############### kernel 4 ################
-        attention_output, attention_bias = self.dense(context_layer)
+        if self.ulysses_sp:
+            context_layer = all_to_all_comm(
+                context_layer,
+                process_group=mpu.get_tensor_model_parallel_group(),
+                scatter_dim=0, gather_dim=2)
+            attention_output = F.linear(context_layer, self.dense.weight)
+            attention_bias = self.dense.bias
+        else:
+            attention_output, attention_bias = self.dense(context_layer)
         
         assert self.drop_path is None, "Do not support drop path for now"
 
@@ -741,6 +801,8 @@ class AttentionOp:
         self.hidden_size_per_attention_head = core.utils.divide(
             query_projection_size, args.num_attention_heads)
         self.dropout_p = args.attention_dropout
+
+        self.ulysses_sp = args.ulysses_sp
     
     def pre_func(self, *inp_activation):
         if self.transfer_weight:
@@ -752,13 +814,21 @@ class AttentionOp:
             ############### kernel 2 ###############
             # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
             # here, np = ng
-            mixed_x_layer = tensor_parallel.linear_with_grad_accumulation_and_async_allreduce(
-                input=layernorm_output,
-                weight=weight,
-                bias=bias,
-                gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-                async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
-                sequence_parallel=self.sequence_parallel,)
+            if self.ulysses_sp:
+                # s/t, b, h -> s/t, b, 3h
+                mixed_x_layer = F.linear(layernorm_output, weight, bias)
+
+                mixed_x_layer = all_to_all_comm(
+                    mixed_x_layer, mpu.get_tensor_model_parallel_group(),
+                    scatter_dim=2, gather_dim=0)
+            else:
+                mixed_x_layer = tensor_parallel.linear_with_grad_accumulation_and_async_allreduce(
+                    input=layernorm_output,
+                    weight=weight,
+                    bias=bias,
+                    gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+                    async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
+                    sequence_parallel=self.sequence_parallel,)
 
         else:
             assert len(inp_activation) == 1, f"len: {len(inp_activation)}"

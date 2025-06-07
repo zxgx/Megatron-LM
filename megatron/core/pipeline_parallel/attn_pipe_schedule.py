@@ -23,8 +23,17 @@ def get_tensor_shapes(args):
     if args.transfer_weight:
         pre_shape = [
             [args.seq_length//tp_size, args.micro_batch_size, args.hidden_size], # qkv input
-            [args.hidden_size*3//tp_size, args.hidden_size],  # qkv linear weight
-            [args.hidden_size*3//tp_size,]]  # qkv linear bias
+        ]
+        if args.ulysses_sp:
+            pre_shape += [
+                [args.hidden_size*3, args.hidden_size],
+                [args.hidden_size*3,]
+            ]
+        else:
+            pre_shape += [
+                [args.hidden_size*3//tp_size, args.hidden_size],  # qkv linear weight
+                [args.hidden_size*3//tp_size,]
+            ]  # qkv linear bias
     else:
         pre_shape = [[args.seq_length, args.micro_batch_size, args.hidden_size//tp_size*3]]
     return pre_shape, o_shape, activation_shape
