@@ -1,3 +1,15 @@
+# HelixPipe: Efficient Distributed Training of Long Sequence Transformers with Attention Parallel Pipeline Parallelism
+This repo contains the source code for HelixPipe: Efficient Distributed Training of Long Sequence Transformers with Attention Parallel Pipeline Parallelism at PPoPP'26. 
+
+All experiment configurations are detailed in `scripts` dir. We use PBS Pro for job submission, and the end-to-end job scripts are in `exp_*.sh`. For example, run
+```bash
+qsub scripts/exp_end2end.sh  # end-to-end experiments running HelixPipe with 1.3B, 3B, 7B models.
+```
+These job scripts can be easily tailed for other job schedulers or bare-metal machines.
+After job finished, log files are dumped into `$WORKLOAD_PREFIX` defined in the job script.
+We provided a one-step script `scripts/collect_data.sh` invoking `scripts/extract.py` to retrieve performance metrics (max memory allocated, reserved, iter time, etc.) from the log files.
+
+# Original README
 Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf), [2](https://arxiv.org/pdf/2104.04473.pdf), and [3](https://arxiv.org/pdf/2205.05198)) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel ([tensor](https://arxiv.org/pdf/1909.08053.pdf), [sequence](https://arxiv.org/pdf/2205.05198), and [pipeline](https://arxiv.org/pdf/2104.04473.pdf)), and multi-node pre-training of transformer based models such as [GPT](https://arxiv.org/abs/2005.14165), [BERT](https://arxiv.org/pdf/1810.04805.pdf), and [T5](https://arxiv.org/abs/1910.10683) using mixed precision.
 
 Below are some of the projects where we have directly used Megatron:
